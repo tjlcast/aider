@@ -263,56 +263,85 @@ class RepoMap:
         return data
 
     def get_tags_raw(self, fname, rel_fname):
-        lang = filename_to_lang(fname)
+        lang = filename_to_lang(fname)              # 根据文件后缀确定语言类型（如 .py → python）
         if not lang:
-            return
+            return                                      # 跳过无法识别的文件类型
 
         try:
-            language = get_language(lang)
-            parser = get_parser(lang)
+            language = get_language(lang)           # 获取tree-sitter语言对象
+            parser = get_parser(lang)               # 获取对应语言的解析器
         except Exception as err:
-            print(f"Skipping file {fname}: {err}")
+            print(f"Skipping file {fname}: {err}")      # 解析器初始化失败时跳过
             return
 
-        query_scm = get_scm_fname(lang)
+        query_scm = get_scm_fname(lang)             # 获取对应语言的.scm查询文件路径
         if not query_scm.exists():
-            return
-        query_scm = query_scm.read_text()
+            return                                      # 无查询规则文件时跳过
+        query_scm = query_scm.read_text()           # 读取.scm文件内容
+        """
+        关键文件: queries/{lang}-tags.scm(定义如何提取tags)
 
-        code = self.io.read_text(fname)
-        if not code:
+        示例规则：
+
+        scm
+        (function_definition name: (identifier) @name.definition.function)
+        """
+
+        code = self.io.read_text(fname)             # 读取指定解析的源代码
+        if not code:                                    # 空文件跳过
             return
-        tree = parser.parse(bytes(code, "utf-8"))
+        tree = parser.parse(bytes(code, "utf-8"))   # 生成语法树(使用 tree-sitter 解析器)
+        """
+        输入处理：源代码 → UTF-8字节流 → 语法树
+
+        输出：tree-sitter的AST节点树
+        """
 
         # Run the tags queries
-        query = language.query(query_scm)
-        captures = query.captures(tree.root_node)
+        query = language.query(query_scm)           # 编译查询规则
+        captures = query.captures(tree.root_node)   # 在AST上执行查询
 
         saw = set()
-        if USING_TSL_PACK:
+        if USING_TSL_PACK:  # 处理不同tree-sitter版本的返回格式
             all_nodes = []
             for tag, nodes in captures.items():
                 all_nodes += [(node, tag) for node in nodes]
         else:
-            all_nodes = list(captures)
+            all_nodes = list(captures)  # 旧版直接返回列表
+
+        """
+        查询结果：捕获的节点列表，每个节点包含：
+
+        代码位置（行/列）
+
+        标记类型（definition/reference）
+
+        标识符名称
+
+        """
 
         for node, tag in all_nodes:
-            if tag.startswith("name.definition."):
+            if tag.startswith("name.definition."):      # 定义节点（函数/类等）
                 kind = "def"
-            elif tag.startswith("name.reference."):
+            elif tag.startswith("name.reference."):     # 引用节点（函数调用等）
                 kind = "ref"
             else:
-                continue
+                continue  # 跳过非目标标签
 
             saw.add(kind)
 
-            result = Tag(
-                rel_fname=rel_fname,
-                fname=fname,
-                name=node.text.decode("utf-8"),
-                kind=kind,
-                line=node.start_point[0],
+            result = Tag(                       # 生成Tag对象
+                rel_fname=rel_fname,                # 相对路径
+                fname=fname,                        # 绝对路径
+                name=node.text.decode("utf-8"),     # 标识符名称
+                kind=kind,                          # 类型(def/ref)
+                line=node.start_point[0],           # 行号（0-based）
             )
+
+            """
+            Tag对象结构:
+            Tag(rel_fname, fname, name, kind, line)
+            """
 
             yield result
 
@@ -320,27 +349,31 @@ class RepoMap:
             return
         if "def" not in saw:
             return
+        """
+        # 当只有定义没有引用时
+        """
 
         # We saw defs, without any refs
         # Some tags files only provide defs (cpp, for example)
         # Use pygments to backfill refs
 
         try:
-            lexer = guess_lexer_for_filename(fname, code)
+            lexer = guess_lexer_for_filename(fname, code)       # 使用pygments分词
         except Exception:  # On Windows, bad ref to time.clock which is deprecated?
             # self.io.tool_error(f"Error lexing {fname}")
             return
 
         tokens = list(lexer.get_tokens(code))
-        tokens = [token[1] for token in tokens if token[0] in Token.Name]
+        tokens = [token[1] for token in tokens if token[0]
+                  in Token.Name]  # if token[0] in Token.Name 只保留标识符
 
-        for token in tokens:
+        for token in tokens:    # 生成补充的引用tags
             yield Tag(
                 rel_fname=rel_fname,
                 fname=fname,
                 name=token,
                 kind="ref",
-                line=-1,
+                line=-1,        # line=-1表示未知行号
             )
 
     def get_ranked_tags(
@@ -348,20 +381,31 @@ class RepoMap:
     ):
         import networkx as nx
 
-        defines = defaultdict(set)
-        references = defaultdict(list)
-        definitions = defaultdict(set)
+        defines = defaultdict(set)          # {符号名: {定义该符号的文件集合}}
+        references = defaultdict(list)      # {符号名: [引用该符号的文件列表]}
+        definitions = defaultdict(set)      # {(文件名, 符号名): {对应的Tag对象}}
 
-        personalization = dict()
+        personalization = dict()            # {文件名: 个性化权重}
 
-        fnames = set(chat_fnames).union(set(other_fnames))
+        fnames = set(chat_fnames).union(set(other_fnames))  # 所有待分析文件
         chat_rel_fnames = set()
 
         fnames = sorted(fnames)
+        """
+        功能: 初始化数据结构, 计算基础权重
+
+        设计: 使用defaultdict避免键检查
+        """
 
         # Default personalization for unspecified files is 1/num_nodes
         # https://networkx.org/documentation/stable/_modules/networkx/algorithms/link_analysis/pagerank_alg.html#pagerank
-        personalize = 100 / len(fnames)
+        personalize = 100 / len(fnames)             # 默认个性化权重
+
+        """
+        关键点：
+            defines 和 references 用于统计符号的定义和引用位置。
+            personalization 用于调整 PageRank 计算时的文件权重（如聊天相关文件权重更高）。
+        """
 
         try:
             cache_size = len(self.TAGS_CACHE)
@@ -399,9 +443,10 @@ class RepoMap:
                 continue
 
             # dump(fname)
-            rel_fname = self.get_rel_fname(fname)
+            rel_fname = self.get_rel_fname(fname)   # 获取文件相对路径
             current_pers = 0.0  # Start with 0 personalization score
 
+            # 计算文件的个性化权重（聊天相关文件、提及文件、路径匹配提及符号的文件）
             if fname in chat_fnames:
                 current_pers += personalize
                 chat_rel_fnames.add(rel_fname)
@@ -425,18 +470,24 @@ class RepoMap:
             if current_pers > 0:
                 personalization[rel_fname] = current_pers  # Assign the final calculated value
 
+            # 提取文件的符号定义和引用
             tags = list(self.get_tags(fname, rel_fname))
             if tags is None:
                 continue
 
             for tag in tags:
                 if tag.kind == "def":
-                    defines[tag.name].add(rel_fname)
+                    defines[tag.name].add(rel_fname)        # 记录定义位置
                     key = (rel_fname, tag.name)
-                    definitions[key].add(tag)
+                    definitions[key].add(tag)               # 存储Tag对象
 
                 elif tag.kind == "ref":
-                    references[tag.name].append(rel_fname)
+                    references[tag.name].append(rel_fname)  # 记录引用位置
+        """
+        get_tags() 方法使用 tree-sitter 解析代码并提取符号。
+
+        聊天相关文件（chat_fnames）和提及文件（mentioned_fnames）会被赋予更高的权重。
+        """
 
         ##
         # dump(defines)
@@ -453,30 +504,35 @@ class RepoMap:
         # Add a small self-edge for every definition that has no references
         # Helps with tree-sitter 0.23.2 with ruby, where "def greet(name)"
         # isn't counted as a def AND a ref. tree-sitter 0.24.0 does.
+        # 处理无引用的定义（添加自环边）
         for ident in defines.keys():
             if ident in references:
                 continue
             for definer in defines[ident]:
                 G.add_edge(definer, definer, weight=0.1, ident=ident)
 
+        # 添加定义-引用边（带动态权重）
         for ident in idents:
             if progress:
                 progress(f"{UPDATING_REPO_MAP_MESSAGE}: {ident}")
 
             definers = defines[ident]
 
-            mul = 1.0
+            mul = 1.0  # 初始乘数
 
-            is_snake = ("_" in ident) and any(c.isalpha() for c in ident)
-            is_camel = any(c.isupper() for c in ident) and any(c.islower() for c in ident)
+            # 检查命名风格
+            is_snake = ("_" in ident) and any(c.isalpha() for c in ident)  # 蛇形命名法，如 my_function
+            is_camel = any(c.isupper() for c in ident) and any(c.islower()
+                                                               for c in ident)  # 驼峰命名法，如 myFunction
+            # 根据不同因素调整乘数
             if ident in mentioned_idents:
-                mul *= 10
+                mul *= 10  # 如果标识符被用户提及，权重增加10倍
             if (is_snake or is_camel) and len(ident) >= 8:
-                mul *= 10
+                mul *= 10  # 如果是蛇形或驼峰命名且长度>=8，权重增加10倍
             if ident.startswith("_"):
-                mul *= 0.1
+                mul *= 0.1  # 如果以下划线开头，权重减少到0.1倍
             if len(defines[ident]) > 5:
-                mul *= 0.1
+                mul *= 0.1  # 如果定义超过5个，权重减少到0.1倍
 
             for referencer, num_refs in Counter(references[ident]).items():
                 for definer in definers:
@@ -484,15 +540,31 @@ class RepoMap:
                     # if referencer == definer:
                     #    continue
 
-                    use_mul = mul
+                    use_mul = mul  # 使用基础乘数
+
+                    # 如果引用文件在聊天文件中，进一步增加权重
                     if referencer in chat_rel_fnames:
                         use_mul *= 50
 
+                    # 对引用次数进行平方根缩放，避免高频引用主导
                     # scale down so high freq (low value) mentions don't dominate
                     num_refs = math.sqrt(num_refs)
 
+                    # 添加边，权重为调整后的乘数乘以缩放后的引用次数
                     G.add_edge(referencer, definer, weight=use_mul * num_refs, ident=ident)
+        """
+        功能：
 
+            构建代码依赖图，节点是文件，边表示符号的引用关系。
+
+            动态调整边的权重（基于符号命名风格、是否被提及等）。
+
+            关键点：
+
+            使用 networkx.MultiDiGraph 存储图结构。
+
+            边的权重影响 PageRank 计算结果（权重越高，重要性越高）。
+        """
         if not references:
             pass
 
@@ -502,6 +574,13 @@ class RepoMap:
             pers_args = dict()
 
         try:
+            # ranked 的返回示例
+            # {
+            #   'aider/main.py': 0.0,
+            #   'aider/repomap.py': 0.0,
+            #   'aider/repomap_test.py': 0.0,
+            #   'aider/utils.py': 0.0,
+            # }
             ranked = nx.pagerank(G, weight="weight", **pers_args)
         except ZeroDivisionError:
             # Issue #1536
@@ -511,7 +590,22 @@ class RepoMap:
                 return []
 
         # distribute the rank from each source node, across all of its out edges
+        # [排名权重分配]
+        # 权重分配逻辑：
+        #   1\ 对每个源节点(src)，获取其PageRank值(src_rank)
+        #   2\ 计算该节点所有出边的总权重(total_weight)
+        #   3\ 将节点的PageRank值按比例分配到各出边：
+        #   4\ 每条边的分配值 = (src_rank × 边权重) / 总权重
+        #   5\ 将分配值累加到目标节点和符号的组合上(ranked_definitions)
+        # 数据结构：ranked_definitions是defaultdict，键为(目标文件名, 符号名)，值为累计的排名分数
         ranked_definitions = defaultdict(float)
+        # ranked_definitions = [
+        #     (("src/models/user.py", "User"), 0.1234),
+        #     (("src/config.py", "config"), 0.0789),
+        #     (("src/utils/math.py", "calculate_total"), 0.0456),
+        #     (("tests/test_math.py", "test_calculate"), 0.0345),
+        #     (("src/utils/validation.py", "_internal_check"), 0.0056)
+        # ]
         for src in G.nodes:
             if progress:
                 progress(f"{UPDATING_REPO_MAP_MESSAGE}: {src}")
@@ -524,21 +618,42 @@ class RepoMap:
                 ident = data["ident"]
                 ranked_definitions[(dst, ident)] += data["rank"]
 
+        # 生成最终排序结果
+        # ranked_tags = [
+        #     # 高排名符号定义
+        #     <Tag def calculate_sum in utils.py>,
+        #     <Tag def calculate_sum in math_ops.py>,
+        #     <Tag def helper_fn in helper.py>,
+        #     # 没有符号的高排名文件
+        #     ("repo/utils.py",),
+        #     ("repo/helper.py",),
+        #     ("repo/math_ops.py",)
+        # ]
         ranked_tags = []
         ranked_definitions = sorted(
             ranked_definitions.items(), reverse=True, key=lambda x: (x[1], x[0])
         )
 
         # dump(ranked_definitions)
-
+        # [生成最终排序结果]
+        # 排序处理：
+        #   按排名分数降序排序ranked_definitions
+        #   跳过聊天相关文件(chat_rel_fnames)
+        #   将符号定义添加到结果列表
         for (fname, ident), rank in ranked_definitions:
             # print(f"{rank:.03f} {fname} {ident}")
             if fname in chat_rel_fnames:
                 continue
             ranked_tags += list(definitions.get((fname, ident), []))
 
+        # [处理无符号定义的文件]
+        # 处理逻辑：
+        #   获取其他文件中没有符号定义的文件集合
+        #   获取已包含在结果中的文件名集合
+        #   按PageRank值排序所有文件
+        #   将高排名但未包含的文件添加到结果
+        #   处理剩余未被包含的文件
         rel_other_fnames_without_tags = set(self.get_rel_fname(fname) for fname in other_fnames)
-
         fnames_already_included = set(rt[0] for rt in ranked_tags)
 
         top_rank = sorted([(rank, node) for (node, rank) in ranked.items()], reverse=True)
@@ -574,35 +689,41 @@ class RepoMap:
                 tuple(sorted(mentioned_fnames)) if mentioned_fnames else None,
                 tuple(sorted(mentioned_idents)) if mentioned_idents else None,
             ]
+        # 生成唯一缓存键，避免重复计算。排序保证不同输入顺序生成相同键，auto 模式包含更多上下文参数
         cache_key = tuple(cache_key)
 
         use_cache = False
         if not force_refresh:
-            if self.refresh == "manual" and self.last_map:
+            if self.refresh == "manual" and self.last_map:      # 手动模式直接返回上次结果
                 return self.last_map
 
-            if self.refresh == "always":
+            if self.refresh == "always":                        # 总是重新计算
                 use_cache = False
-            elif self.refresh == "files":
+            elif self.refresh == "files":                       # 仅当文件相同时缓存
                 use_cache = True
-            elif self.refresh == "auto":
+            elif self.refresh == "auto":                        # 根据处理时间决定
                 use_cache = self.map_processing_time > 1.0
 
             # Check if the result is in the cache
-            if use_cache and cache_key in self.map_cache:
+            if use_cache and cache_key in self.map_cache:       # 命中缓存
                 return self.map_cache[cache_key]
 
         # If not in cache or force_refresh is True, generate the map
         start_time = time.time()
-        result = self.get_ranked_tags_map_uncached(
+        result = self.get_ranked_tags_map_uncached(             # 实际计算入口
             chat_fnames, other_fnames, max_map_tokens, mentioned_fnames, mentioned_idents
         )
         end_time = time.time()
-        self.map_processing_time = end_time - start_time
+        self.map_processing_time = end_time - start_time        # 记录耗时用于auto模式, 记录处理时间用于自适应缓存策略
 
         # Store the result in the cache
-        self.map_cache[cache_key] = result
-        self.last_map = result
+        self.map_cache[cache_key] = result                      # 存储到缓存字典
+        self.last_map = result                                  # 更新最后一次结果
+        """
+        双缓存机制：
+            map_cache: 键值对缓存, 支持多组参数组合
+            last_map: 快速访问最新结果, 用于manual模式
+        """
 
         return result
 
@@ -614,13 +735,13 @@ class RepoMap:
         mentioned_fnames=None,
         mentioned_idents=None,
     ):
-        if not other_fnames:
+        if not other_fnames:                                # 确保other_fnames是列表
             other_fnames = list()
-        if not max_map_tokens:
+        if not max_map_tokens:                              # 默认token限制
             max_map_tokens = self.max_map_tokens
-        if not mentioned_fnames:
+        if not mentioned_fnames:                            # 空提及文件集合
             mentioned_fnames = set()
-        if not mentioned_idents:
+        if not mentioned_idents:                            # 空提及标识符集合
             mentioned_idents = set()
 
         spin = Spinner(UPDATING_REPO_MAP_MESSAGE)
@@ -630,30 +751,38 @@ class RepoMap:
             other_fnames,
             mentioned_fnames,
             mentioned_idents,
-            progress=spin.step,
+            progress=spin.step,                             # 进度反馈：通过Spinner显示处理状态
         )
 
         other_rel_fnames = sorted(set(self.get_rel_fname(fname) for fname in other_fnames))
-        special_fnames = filter_important_files(other_rel_fnames)
+        special_fnames = filter_important_files(other_rel_fnames)   # 筛选关键文件
         ranked_tags_fnames = set(tag[0] for tag in ranked_tags)
         special_fnames = [fn for fn in special_fnames if fn not in ranked_tags_fnames]
-        special_fnames = [(fn,) for fn in special_fnames]
+        special_fnames = [(fn,) for fn in special_fnames]           # 转换为tag格式
 
-        ranked_tags = special_fnames + ranked_tags
+        ranked_tags = special_fnames + ranked_tags                  # 合并到结果
 
         spin.step()
 
-        num_tags = len(ranked_tags)
-        lower_bound = 0
-        upper_bound = num_tags
-        best_tree = None
-        best_tree_tokens = 0
+        num_tags = len(ranked_tags)     # 初始范围
+        lower_bound = 0                 # 初始范围
+        upper_bound = num_tags          # 初始范围
+        best_tree = None                # 最优结果记录
+        best_tree_tokens = 0            # 最优结果记录
 
         chat_rel_fnames = set(self.get_rel_fname(fname) for fname in chat_fnames)
 
         self.tree_cache = dict()
 
-        middle = min(int(max_map_tokens // 25), num_tags)
+        middle = min(int(max_map_tokens // 25), num_tags)   # 初始中点
+        # 通过二分查找平衡内容质量与token限制
+        """
+        关键逻辑：
+
+            每次迭代生成部分内容的代码树
+
+            允许15%误差范围内提前终止
+        """
         while lower_bound <= upper_bound:
             # dump(lower_bound, middle, upper_bound)
 
@@ -663,8 +792,8 @@ class RepoMap:
                 show_tokens = str(middle)
             spin.step(f"{UPDATING_REPO_MAP_MESSAGE}: {show_tokens} tokens")
 
-            tree = self.to_tree(ranked_tags[:middle], chat_rel_fnames)
-            num_tokens = self.token_count(tree)
+            tree = self.to_tree(ranked_tags[:middle], chat_rel_fnames)              # 生成部分树
+            num_tokens = self.token_count(tree)                                     # 计算token数
 
             pct_err = abs(num_tokens - max_map_tokens) / max_map_tokens
             ok_err = 0.15
@@ -678,7 +807,7 @@ class RepoMap:
             if num_tokens < max_map_tokens:
                 lower_bound = middle + 1
             else:
-                upper_bound = middle - 1
+                upper_bound = middle - 1        # 查找第一个满足条件的元素
 
             middle = int((lower_bound + upper_bound) // 2)
 
